@@ -1,0 +1,325 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Event-driven serverless file processing using S3, Lambda, VPC and SNS
+
+Parameters:
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive processing alerts
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+
+  BucketName:
+    Type: String
+    Description: Globally unique lowercase S3 bucket name
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+
+  CreateS3Endpoint:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Create an S3 Gateway VPC Endpoint
+
+Resources:
+
+  # 1. VPC AND NETWORKING
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: FileProcessingVPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: FileProcessingPublicSubnet
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+      Tags:
+        - Key: Name
+          Value: FileProcessingPrivateSubnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachInternetGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachInternetGateway
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    DependsOn: PublicDefaultRoute
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      ConnectivityType: public
+      Tags:
+        - Key: Name
+          Value: FileProcessingNAT
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound access for file processing Lambda
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: CreateEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      VpcEndpointType: Gateway
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  # 2. SNS NOTIFICATIONS
+
+  FileProcessingAlerts:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: FileProcessingAlerts
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+      TopicArn: !Ref FileProcessingAlerts
+
+  # 3. IAM ROLE FOR LAMBDA
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: FileProcessingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BucketName}/incoming/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${BucketName}/processed/*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref FileProcessingAlerts
+
+  # 4. LAMBDA FUNCTION
+
+  FileProcessingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FileProcessingFunction
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref BucketName
+          SNS_TOPIC_ARN: !Ref FileProcessingAlerts
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from urllib.parse import unquote_plus
+
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              results = []
+
+              for record in event.get('Records', []):
+                  bucket = record['s3']['bucket']['name']
+                  key = unquote_plus(record['s3']['object']['key'])
+
+                  response = s3.get_object(
+                      Bucket=bucket,
+                      Key=key
+                  )
+
+                  metadata = {
+                      'status': 'SUCCESS',
+                      'source_bucket': bucket,
+                      'source_key': key,
+                      'file_size_bytes': response['ContentLength'],
+                      'content_type': response.get(
+                          'ContentType', 'unknown'
+                      ),
+                      'processed_by': context.function_name
+                  }
+
+                  output_key = (
+                      'processed/' + key.split('/')[-1]
+                      + '.metadata.json'
+                  )
+
+                  s3.put_object(
+                      Bucket=os.environ['OUTPUT_BUCKET'],
+                      Key=output_key,
+                      Body=json.dumps(metadata, indent=2),
+                      ContentType='application/json'
+                  )
+
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject='File processing successful',
+                      Message=json.dumps(metadata, indent=2)
+                  )
+
+                  results.append(metadata)
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(results)
+              }
+
+  # 5. PERMISSION FOR S3 TO INVOKE LAMBDA
+
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt FileProcessingLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:s3:::${BucketName}'
+      SourceAccount: !Ref AWS::AccountId
+
+  # 6. S3 BUCKET AND EVENT NOTIFICATION
+
+  FileUploadBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: S3InvokeLambdaPermission
+    Properties:
+      BucketName: !Ref BucketName
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt FileProcessingLambda.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+
+Conditions:
+  CreateEndpoint: !Equals [!Ref CreateS3Endpoint, 'true']
+
+Outputs:
+  S3BucketName:
+    Description: Upload original files under incoming/
+    Value: !Ref FileUploadBucket
+
+  LambdaFunctionName:
+    Value: !Ref FileProcessingLambda
+
+  SNSTopicArn:
+    Value: !Ref FileProcessingAlerts
+
+  VPCId:
+    Value: !Ref VPC
+
+  PrivateSubnetId:
+    Value: !Ref PrivateSubnet
